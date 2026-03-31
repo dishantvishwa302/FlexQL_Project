@@ -1,5 +1,9 @@
 # FlexQL: Detailed System Design Document
 
+### Github Repository:
+
+[FlexQL-Repo](https://github.com/dishantvishwa302/FlexQL_Project)
+
 ## 1. Introduction & Project Goals
 FlexQL is a custom, high-performance SQL-like database driver and server implemented in C++17. The primary objective is to manage large-scale relational data (10M+ rows) with a minimal memory footprint while maintaining low-latency query execution.
 
