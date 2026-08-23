@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <sstream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -17,6 +16,9 @@ struct FlexQL {
 
 int flexql_open(const char *host, int port, FlexQL **db) {
     if (!host || !db) return FLEXQL_ERROR;
+
+    const char *ip = host;
+    if (strcmp(host, "localhost") == 0) ip = "127.0.0.1";
 
     FlexQL *database = (FlexQL *)malloc(sizeof(FlexQL));
     if (!database) return FLEXQL_ERROR;
@@ -32,7 +34,7 @@ int flexql_open(const char *host, int port, FlexQL **db) {
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
 
-    if (inet_pton(AF_INET, host, &server_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
         close(database->socket_fd);
         free(database);
         return FLEXQL_ERROR;
@@ -60,26 +62,22 @@ int flexql_close(FlexQL *db) {
     return FLEXQL_OK;
 }
 
-// Helper: receive complete response from server (reads until connection closes or delimiter)
 static std::string recv_response(int fd) {
     std::string response;
     char buf[4096];
     while (true) {
         int n = recv(fd, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
-        buf[n] = '\0';
-        response += std::string(buf, n);
-        
-        if (response.find("<EOF>\n") != std::string::npos) {
-            // Remove the marker before returning
-            response.erase(response.length() - 6);
+        response.append(buf, static_cast<size_t>(n));
+        size_t eof_pos = response.find("<EOF>\n");
+        if (eof_pos != std::string::npos) {
+            response.erase(eof_pos);
             break;
         }
     }
     return response;
 }
 
-// Helper: split string by delimiter
 static std::vector<std::string> split(const std::string& s, const std::string& delim) {
     std::vector<std::string> parts;
     size_t start = 0, pos;
@@ -97,75 +95,65 @@ int flexql_exec(FlexQL *db, const char *sql,
 
     if (!db || !sql) return FLEXQL_ERROR;
 
-    // Send query
     std::string query_to_send = std::string(sql) + "\n<EOF>\n";
     if (send(db->socket_fd, query_to_send.c_str(), query_to_send.length(), 0) < 0) {
         if (errmsg) *errmsg = strdup("Send failed");
         return FLEXQL_ERROR;
     }
 
-    // Receive complete response
     std::string response = recv_response(db->socket_fd);
     if (response.empty()) {
         if (errmsg) *errmsg = strdup("No response from server");
         return FLEXQL_ERROR;
     }
 
-    // Parse response wire format:
-    // OK\nTIME: Xms\nROWS_SCANNED: N\nROWS_RETURNED: M\n---\ncol1 | col2 | ...\n...
-    // or ERROR: message\n
-
-    if (response.length() >= 5 && response.substr(0, 5) == "ERROR") {
+    if (response.compare(0, 5, "ERROR") == 0) {
         if (errmsg) {
-            std::string msg = response.substr(7); // skip "ERROR: "
-            // Remove trailing newline
-            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
-                msg.pop_back();
+            std::string msg = response.size() > 7 ? response.substr(7) : response;
+            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
             *errmsg = strdup(msg.c_str());
         }
         return FLEXQL_ERROR;
     }
 
-    // Find the row data section (after "---\n")
-    size_t sep_pos = response.find("---\n");
-    if (sep_pos == std::string::npos || !callback) {
-        // No rows or no callback needed
-        return FLEXQL_OK;
+    if (!callback) return FLEXQL_OK;
+
+    std::vector<std::string> col_name_bufs;
+    size_t col_line = response.find("COLUMNS: ");
+    if (col_line != std::string::npos) {
+        size_t eol = response.find('\n', col_line);
+        std::string names = response.substr(col_line + 9, eol - col_line - 9);
+        col_name_bufs = split(names, " | ");
     }
 
-    // Extract the rows section
-    std::string rows_section = response.substr(sep_pos + 4);
+    size_t sep_pos = response.find("---\n");
+    if (sep_pos == std::string::npos) return FLEXQL_OK;
 
-    // Parse each row line: "val1 | val2 | val3\n"
-    // We need column names too — extract from ROWS_RETURNED onwards
-    // The server currently does not send column names in a dedicated line.
-    // We'll use positional column names col0, col1, ... as placeholders.
-    // (Full column names require a schema query — adequately handled by the REPL)
+    std::string rows_section = response.substr(sep_pos + 4);
     std::vector<std::string> row_lines = split(rows_section, "\n");
 
     for (const auto& line : row_lines) {
         if (line.empty()) continue;
 
-        // Split on " | "
         std::vector<std::string> cells = split(line, " | ");
-        int col_count = (int)cells.size();
+        int col_count = static_cast<int>(cells.size());
 
-        // Build C-string arrays for callback
+        if (col_name_bufs.empty()) {
+            for (int i = 0; i < col_count; i++) {
+                col_name_bufs.push_back("col" + std::to_string(i));
+            }
+        }
+
         std::vector<char*> values(col_count);
-        std::vector<char*> col_names(col_count);
-        std::vector<std::string> name_bufs(col_count);
-
+        std::vector<char*> names(col_count);
         for (int i = 0; i < col_count; i++) {
             values[i] = const_cast<char*>(cells[i].c_str());
-            name_bufs[i] = "col" + std::to_string(i);
-            col_names[i] = const_cast<char*>(name_bufs[i].c_str());
+            names[i] = const_cast<char*>(col_name_bufs[static_cast<size_t>(i) < col_name_bufs.size()
+                                                           ? static_cast<size_t>(i)
+                                                           : 0].c_str());
         }
 
-        int ret = callback(arg, col_count, values.data(), col_names.data());
-        if (ret != 0) {
-            // Callback requested abort
-            break;
-        }
+        if (callback(arg, col_count, values.data(), names.data()) != 0) break;
     }
 
     return FLEXQL_OK;

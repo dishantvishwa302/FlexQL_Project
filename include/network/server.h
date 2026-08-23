@@ -5,6 +5,7 @@
 #include "../query/executor.h"
 #include "../cache/lru_cache.h"
 #include <memory>
+#include <atomic>
 
 namespace flexql {
 
@@ -16,7 +17,7 @@ private:
     int port;
     int max_connections;
     int server_socket;
-    bool running;
+    std::atomic<bool> running;
     
     std::shared_ptr<Database> database;
     std::shared_ptr<LRUCache> cache;
@@ -33,7 +34,7 @@ public:
     std::string formatResponse(const QueryResult& result);
     
     int getPort() const { return port; }
-    bool isRunning() const { return running; }
+    bool isRunning() const { return running.load(); }
     std::shared_ptr<Database> getDatabase() { return database; }
 };
 

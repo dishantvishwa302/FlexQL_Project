@@ -32,16 +32,15 @@ size_t BTree::search(int key, bool& found) const {
 
 size_t BTree::searchNode(const BTreeNode* node, int key, bool& found) const {
     auto it = std::lower_bound(node->keys, node->keys + node->num_keys, key);
-    int i = std::distance(node->keys, it);
+    int i = static_cast<int>(std::distance(node->keys, it));
 
+    // Classic B-tree: every node stores real keys, not just separators.
     if (i < node->num_keys && key == node->keys[i]) {
-        if (node->is_leaf) {
-            found = true;
-            return node->vals[i];
-        }
+        found = true;
+        return node->vals[i];
     }
 
-    if (node->is_leaf) return 0; // Not found
+    if (node->is_leaf) return 0;
     return searchNode(node->children[i], key, found);
 }
 
@@ -67,17 +66,13 @@ void BTree::rangeNode(const BTreeNode* node, int lo, int hi,
             i++;
         }
     } else {
-        // Traverse children interleaved with keys
         for (; i <= node->num_keys; i++) {
-            // Visit child[i] first (keys are between keys[i-1] and keys[i])
+            rangeNode(node->children[i], lo, hi, result);
             if (i < node->num_keys) {
-                rangeNode(node->children[i], lo, hi, result);
-                if (node->keys[i] <= hi) {
-                    // Internal node key is just a separator, don't add it (data is in leaves)
+                if (node->keys[i] >= lo && node->keys[i] <= hi) {
+                    result.push_back(node->vals[i]);
                 }
                 if (node->keys[i] > hi) break;
-            } else {
-                rangeNode(node->children[i], lo, hi, result);
             }
         }
     }

@@ -10,10 +10,10 @@
 
 namespace flexql {
 
-// In-memory B-Tree for primary key indexing.
-// Order 64: each node holds up to 127 keys, min 63 keys (except root).
-// Leaf nodes store (int_key -> row_id) pairs.
-// row_id is the physical position in the ColumnStore columns[] arrays.
+// In-memory B-tree: INT primary key -> byte offset in the row file.
+// t = 64, so a node holds at most 127 keys. Height stays tiny:
+// 10 million keys fit in about 3 levels, so a point lookup is a handful of
+// array scans — easy to draw on a whiteboard.
 
 static constexpr int BTREE_ORDER = 64; // max children per node = 2*ORDER
 static constexpr int MAX_KEYS    = 2 * BTREE_ORDER - 1;

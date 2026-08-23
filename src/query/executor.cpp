@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <sstream>
 #include <unordered_map>
+#include <climits>
+#include <cstdint>
 
 namespace flexql {
 
@@ -113,6 +115,8 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
         
         if (stmt.has_order_by)
             cache_key += ":O:" + stmt.order_by.column_name + (stmt.order_by.is_desc ? "DESC" : "ASC");
+        if (stmt.limit >= 0)
+            cache_key += ":L:" + std::to_string(stmt.limit);
                          
         std::string cached_val;
         if (cache->get(cache_key, cached_val)) {
@@ -151,8 +155,8 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
     }
 
     try {
-        auto table        = database->getTable(stmt.table_name);
-        auto column_store = database->getColumnStore(stmt.table_name);
+        auto table = database->getTable(stmt.table_name);
+        auto store = database->getRowStore(stmt.table_name);
 
         // Pre-validate select columns
         if (!stmt.columns.empty()) {
@@ -177,12 +181,12 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
 
             // --- B-Tree index fast path (PK column, INT) ---
             bool used_index = false;
-            if (column_store->hasPKIndex() && col_idx == column_store->getPKColIdx() &&
+            if (store->hasPKIndex() && col_idx == store->getPKColIdx() &&
                 stmt.where.value.type == DataType::INT)
             {
                 int target = stmt.where.value.data.int_val;
                 if (stmt.where.op == ComparisonOp::EQ) {
-                    Row row = column_store->getRowByPK(target);
+                    Row row = store->getRowByPK(target);
                     result.stats.rows_scanned = 1;
                     if (!row.deleted) matching_rows.push_back(std::move(row));
                     used_index = true;
@@ -196,10 +200,10 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
                     else if (stmt.where.op == ComparisonOp::LE) hi = target;
                     else if (stmt.where.op == ComparisonOp::GT) lo = target + 1;
                     else if (stmt.where.op == ComparisonOp::GE) lo = target;
-                    auto row_ids = column_store->getPKRange(lo, hi);
+                    auto row_ids = store->getPKRange(lo, hi);
                     result.stats.rows_scanned = row_ids.size();
                     for (size_t rid : row_ids) {
-                        Row row = column_store->getRow(rid);
+                        Row row = store->getRow(rid);
                         if (!row.deleted) matching_rows.push_back(std::move(row));
                     }
                     used_index = true;
@@ -208,7 +212,7 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
 
             // --- Full scan fallback ---
             if (!used_index) {
-                auto all_rows = column_store->getAllRows();
+                auto all_rows = store->getAllRows();
                 result.stats.rows_scanned = all_rows.size();
                 for (auto& row : all_rows) {
                     if (row.deleted) continue;
@@ -224,10 +228,14 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
                         case ComparisonOp::GE: matches = greaterEqual(row_val, stmt.where.value); break;
                     }
                     if (matches) matching_rows.push_back(std::move(row));
+                    if (!stmt.has_order_by && stmt.limit >= 0 &&
+                        static_cast<int>(matching_rows.size()) >= stmt.limit) {
+                        break;
+                    }
                 }
             }
         } else {
-            matching_rows = column_store->getAllRows();
+            matching_rows = store->getAllRows();
             result.stats.rows_scanned = matching_rows.size();
         }
 
@@ -252,6 +260,10 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
                         }
                     });
             }
+        }
+
+        if (stmt.limit >= 0 && static_cast<int>(matching_rows.size()) > stmt.limit) {
+            matching_rows.resize(static_cast<size_t>(stmt.limit));
         }
 
         // Project columns
@@ -309,7 +321,9 @@ QueryResult QueryExecutor::executeSelect(const SelectStatement& stmt) {
                              
             if (stmt.has_order_by)
                 cache_key += ":O:" + stmt.order_by.column_name + (stmt.order_by.is_desc ? "DESC" : "ASC");
-                
+            if (stmt.limit >= 0)
+                cache_key += ":L:" + std::to_string(stmt.limit);
+
             cache->put(cache_key, cache_payload);
         }
 
@@ -334,23 +348,17 @@ QueryResult QueryExecutor::executeInsert(const InsertStatement& stmt) {
     result.stats.cache_hit = false;
 
     try {
-        auto table        = database->getTable(stmt.table_name);
-        auto column_store = database->getColumnStore(stmt.table_name);
+        auto store = database->getRowStore(stmt.table_name);
 
-        // Cast away const to steal values safely
-        std::vector<Value>& flat_values = const_cast<std::vector<Value>&>(stmt.flat_values);
         size_t total_rows = 0;
         if (stmt.num_columns > 0) {
-            total_rows = flat_values.size() / stmt.num_columns;
+            total_rows = stmt.flat_values.size() / stmt.num_columns;
         }
 
         time_t expiry = (stmt.ttl_seconds > 0) ? std::time(nullptr) + stmt.ttl_seconds : 0;
 
-        // Single-lock batch insert + single write directly from flat array
-        column_store->insertBatchFlat(flat_values, stmt.num_columns, expiry);
-
-        // Explicit batch commit
-        column_store->flush();
+        store->insertBatchFlat(stmt.flat_values, stmt.num_columns, expiry);
+        store->flush();
         result.stats.rows_returned = static_cast<int>(total_rows);
 
         // Invalidate cache entries for this table
@@ -377,7 +385,7 @@ QueryResult QueryExecutor::executeCreateTable(const CreateTableStatement& stmt) 
     result.stats.cache_hit = false;
 
     try {
-        database->createTable(stmt.table_name, stmt.columns);
+        database->createTable(stmt.table_name, stmt.columns, stmt.if_not_exists);
         result.stats.rows_returned = 1;
     } catch (const std::exception& e) {
         result.success = false;
@@ -402,8 +410,8 @@ QueryResult QueryExecutor::executeDelete(const DeleteStatement& stmt) {
     result.stats.rows_returned = 0;
 
     try {
-        auto table        = database->getTable(stmt.table_name);
-        auto column_store = database->getColumnStore(stmt.table_name);
+        auto table = database->getTable(stmt.table_name);
+        auto store = database->getRowStore(stmt.table_name);
 
         if (stmt.has_where) {
             int col_idx = table->getColumnIndex(stmt.where.column_name);
@@ -415,27 +423,23 @@ QueryResult QueryExecutor::executeDelete(const DeleteStatement& stmt) {
 
             // --- B-Tree fast path for PK equality delete ---
             bool used_index = false;
-            if (column_store->hasPKIndex() && col_idx == column_store->getPKColIdx() &&
+            if (store->hasPKIndex() && col_idx == store->getPKColIdx() &&
                 stmt.where.op == ComparisonOp::EQ &&
                 stmt.where.value.type == DataType::INT)
             {
-                int target = stmt.where.value.data.int_val;
-                bool found = false;
-                size_t row_id = column_store->getPKRange(target, target).empty()
-                                ? SIZE_MAX
-                                : column_store->getPKRange(target, target)[0];
-                if (row_id != SIZE_MAX) {
-                    column_store->deleteRow(row_id);
+                Row row = store->getRowByPK(stmt.where.value.data.int_val);
+                result.stats.rows_scanned = 1;
+                if (!row.deleted) {
+                    store->deleteRow(row.file_offset);
                     result.stats.rows_returned = 1;
                 }
-                result.stats.rows_scanned = 1;
+                store->flush();
                 used_index = true;
-                (void)found;
             }
 
             // --- Full scan fallback ---
             if (!used_index) {
-                auto all_rows = column_store->getAllRows();
+                auto all_rows = store->getAllRows();
                 result.stats.rows_scanned = all_rows.size();
                 int deleted_count = 0;
                 for (const auto& row : all_rows) {
@@ -450,20 +454,20 @@ QueryResult QueryExecutor::executeDelete(const DeleteStatement& stmt) {
                             case ComparisonOp::GT: matches = greaterThan(row_val, stmt.where.value); break;
                             case ComparisonOp::GE: matches = greaterEqual(row_val, stmt.where.value); break;
                         }
-                        if (matches) { column_store->deleteRow(row.file_offset); deleted_count++; }
+                        if (matches) { store->deleteRow(row.file_offset); deleted_count++; }
                     }
                 }
-                column_store->flush();
+                store->flush();
                 result.stats.rows_returned = deleted_count;
             }
         } else {
             // DELETE all rows
-            auto all_rows = column_store->getAllRows();
+            auto all_rows = store->getAllRows();
             result.stats.rows_scanned = all_rows.size();
             for (const auto& row : all_rows) {
-                column_store->deleteRow(row.file_offset);
+                store->deleteRow(row.file_offset);
             }
-            column_store->flush();
+            store->flush();
             result.stats.rows_returned = all_rows.size();
         }
 
@@ -495,8 +499,8 @@ QueryResult QueryExecutor::executeJoin(const JoinStatement& stmt) {
     try {
         auto left_table   = database->getTable(stmt.left_table);
         auto right_table  = database->getTable(stmt.right_table);
-        auto left_store   = database->getColumnStore(stmt.left_table);
-        auto right_store  = database->getColumnStore(stmt.right_table);
+        auto left_store   = database->getRowStore(stmt.left_table);
+        auto right_store  = database->getRowStore(stmt.right_table);
 
         int left_join_idx  = left_table->getColumnIndex(stmt.left_join_col);
         int right_join_idx = right_table->getColumnIndex(stmt.right_join_col);
@@ -650,6 +654,10 @@ QueryResult QueryExecutor::executeJoin(const JoinStatement& stmt) {
                         }
                     });
             }
+        }
+
+        if (stmt.limit >= 0 && static_cast<int>(result.rows.size()) > stmt.limit) {
+            result.rows.resize(static_cast<size_t>(stmt.limit));
         }
 
         result.stats.rows_returned = result.rows.size();

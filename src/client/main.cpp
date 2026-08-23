@@ -1,192 +1,145 @@
+#include "../../include/flexql.h"
 #include <iostream>
 #include <string>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <cstring>
-#include <unistd.h>
+#include <chrono>
+#include <cstdlib>
+#include <cctype>
 
-class FlexQLClient {
-private:
-    int socket_fd;
-    std::string host;
-    int port;
-    bool connected;
-    
-public:
-    FlexQLClient(const std::string& h, int p) 
-        : socket_fd(-1), host(h), port(p), connected(false) {}
-    
-    ~FlexQLClient() {
-        disconnect();
-    }
-    
-    bool connect() {
-        // Create socket
-        socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (socket_fd < 0) {
-            std::cerr << "✗ Error: Could not create socket" << std::endl;
-            return false;
-        }
-        
-        // Connect to server
-        struct sockaddr_in server_addr;
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(port);
-        
-        if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-            std::cerr << "✗ Error: Invalid server address" << std::endl;
-            close(socket_fd);
-            return false;
-        }
-        
-        if (::connect(socket_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            std::cerr << "✗ Error: Could not connect to server at " << host << ":" << port << std::endl;
-            std::cerr << "  Make sure the server is running: ./bin/flexql_server" << std::endl;
-            close(socket_fd);
-            return false;
-        }
-        
-        connected = true;
-        return true;
-    }
-    
-    void disconnect() {
-        if (socket_fd >= 0) {
-            close(socket_fd);
-            socket_fd = -1;
-            connected = false;
-        }
-    }
-    
-    bool isConnected() const {
-        return connected;
-    }
-    
-    std::string executeQuery(const std::string& query) {
-        if (!connected) {
-            return "✗ Not connected to server. Please start the server first.";
-        }
-        
-        // Send query to server
-        std::string payload = query + "\n<EOF>\n";
-        if (send(socket_fd, payload.c_str(), payload.length(), 0) < 0) {
-            std::cerr << "✗ Error: Failed to send query to server" << std::endl;
-            connected = false;
-            return "ERROR: Connection lost";
-        }
-        
-        // Receive response
-        char buffer[8192];
-        memset(buffer, 0, sizeof(buffer));
-        
-        int n = recv(socket_fd, buffer, sizeof(buffer) - 1, 0);
-        if (n <= 0) {
-            std::cerr << "✗ Error: Server disconnected" << std::endl;
-            connected = false;
-            return "ERROR: Connection lost";
-        }
-        
-        buffer[n] = '\0';
-        return std::string(buffer);
-    }
+namespace {
+
+struct PrintState {
+    bool header_printed = false;
+    int rows = 0;
 };
 
+int print_row(void* arg, int col_count, char** values, char** names) {
+    auto* state = static_cast<PrintState*>(arg);
+    if (!state->header_printed) {
+        for (int i = 0; i < col_count; i++) {
+            if (i) std::cout << " | ";
+            std::cout << (names[i] ? names[i] : "");
+        }
+        std::cout << "\n─────────────────────────────────────────────────────────────\n";
+        state->header_printed = true;
+    }
+    for (int i = 0; i < col_count; i++) {
+        if (i) std::cout << " | ";
+        std::cout << (values[i] ? values[i] : "NULL");
+    }
+    std::cout << "\n";
+    state->rows++;
+    return 0;
+}
+
+void trim(std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        s.clear();
+        return;
+    }
+    size_t end = s.find_last_not_of(" \t\r\n");
+    s = s.substr(start, end - start + 1);
+}
+
 void displayHeader() {
-    std::cout << "\n╔════════════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║           FlexQL Client v1.0                              ║" << std::endl;
-    std::cout << "╚════════════════════════════════════════════════════════════╝\n" << std::endl;
+    std::cout << "\n╔════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║           FlexQL Client v1.0                              ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════════╝\n\n";
 }
 
 void displayHelp() {
-    std::cout << "╔══════════════════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║ Available Commands:                                              ║" << std::endl;
-    std::cout << "║                                                                  ║" << std::endl;
-    std::cout << "║  CREATE TABLE name (col1 TYPE, col2 TYPE)                       ║" << std::endl;
-    std::cout << "║  INSERT INTO table VALUES (val1, val2, ...)                     ║" << std::endl;
-    std::cout << "║  SELECT * FROM table [WHERE condition]                         ║" << std::endl;
-    std::cout << "║  DELETE FROM table WHERE condition                             ║" << std::endl;
-    std::cout << "║  help       - Show this message                                ║" << std::endl;
-    std::cout << "║  exit       - Exit the client                                  ║" << std::endl;
-    std::cout << "║                                                                  ║" << std::endl;
-    std::cout << "║ Example:                                                         ║" << std::endl;
-    std::cout << "║  CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT) ║" << std::endl;
-    std::cout << "║  INSERT INTO users VALUES (1, 'John', 25)                       ║" << std::endl;
-    std::cout << "║  SELECT * FROM users                                            ║" << std::endl;
-    std::cout << "╚══════════════════════════════════════════════════════════════════╝\n" << std::endl;
+    std::cout <<
+        "Commands (SQL subset from the assignment + interview extras)\n"
+        "\n"
+        "  CREATE TABLE name (col TYPE [PRIMARY KEY], ...)\n"
+        "  INSERT INTO name VALUES (v1, v2, ...), (...)\n"
+        "  SELECT col, ... FROM name [WHERE col op val] [ORDER BY col [ASC|DESC]] [LIMIT n]\n"
+        "  SELECT * FROM a INNER JOIN b ON a.col = b.col [WHERE ...] [LIMIT n]\n"
+        "  DELETE FROM name [WHERE col op val]\n"
+        "  INSERT ... WITH TTL seconds     -- row expires after N seconds\n"
+        "\n"
+        "  Types: INT, DECIMAL, VARCHAR, DATETIME\n"
+        "  help / exit / clear\n"
+        "\n"
+        "Example:\n"
+        "  CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT);\n"
+        "  INSERT INTO users VALUES (1, 'Alice', 22), (2, 'Bob', 30);\n"
+        "  SELECT * FROM users WHERE id = 1;\n"
+        "  SELECT * FROM users;   -- run twice to see the LRU cache\n\n";
 }
+
+} // namespace
 
 int main(int argc, char** argv) {
     std::string host = "127.0.0.1";
     int port = 9000;
-    
-    if (argc > 1) {
-        host = argv[1];
-    }
+
+    if (argc > 1) host = argv[1];
     if (argc > 2) {
         try {
             port = std::stoi(argv[2]);
         } catch (...) {
-            std::cerr << "Usage: " << argv[0] << " [host] [port]" << std::endl;
+            std::cerr << "Usage: " << argv[0] << " [host] [port]\n";
             return 1;
         }
     }
-    
+
     displayHeader();
-    
-    FlexQLClient client(host, port);
-    
-    std::cout << "Connecting to server at " << host << ":" << port << "..." << std::endl;
-    if (!client.connect()) {
+    std::cout << "Connecting to " << host << ":" << port << "...\n";
+
+    FlexQL* db = nullptr;
+    if (flexql_open(host.c_str(), port, &db) != FLEXQL_OK) {
+        std::cerr << "Could not connect. Start the server first: ./bin/flexql_server\n";
         return 1;
     }
-    
-    std::cout << "✓ Successfully connected to server\n" << std::endl;
+
+    std::cout << "Connected. REPL uses flexql_open / flexql_exec / flexql_close.\n\n";
     displayHelp();
-    
+
     std::string input;
-    std::string query;
-    
     while (true) {
         std::cout << "FlexQL> ";
-        std::getline(std::cin, input);
-        
-        // Trim whitespace
-        input.erase(0, input.find_first_not_of(" \t\r\n"));
-        input.erase(input.find_last_not_of(" \t\r\n") + 1);
-        
-        if (input.empty()) {
-            continue;
-        }
-        
-        // Handle special commands
+        if (!std::getline(std::cin, input)) break;
+        trim(input);
+        if (input.empty()) continue;
+
         if (input == "exit" || input == "quit") {
-            std::cout << "\n✓ Disconnecting from server..." << std::endl;
-            client.disconnect();
-            std::cout << "✓ Goodbye!" << std::endl;
-            break;
+            flexql_close(db);
+            std::cout << "Goodbye.\n";
+            return 0;
         }
-        
         if (input == "help") {
             displayHelp();
             continue;
         }
-        
         if (input == "clear") {
-            system("clear");
+            int clear_rc = std::system("clear");
+            (void)clear_rc;
             displayHeader();
             continue;
         }
-        
-        // Execute query
-        std::cout << "\nExecuting query...\n" << std::endl;
-        std::string response = client.executeQuery(input);
-        
-        std::cout << "Response:" << std::endl;
-        std::cout << "─────────────────────────────────────────────────────────────" << std::endl;
-        std::cout << response << std::endl;
-        std::cout << "─────────────────────────────────────────────────────────────\n" << std::endl;
+
+        PrintState state;
+        char* errmsg = nullptr;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        int rc = flexql_exec(db, input.c_str(), print_row, &state, &errmsg);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+        if (rc != FLEXQL_OK) {
+            std::cout << "ERROR: " << (errmsg ? errmsg : "unknown") << "\n\n";
+            if (errmsg) flexql_free(errmsg);
+            continue;
+        }
+
+        if (state.rows == 0) {
+            std::cout << "OK";
+        } else {
+            std::cout << state.rows << " row(s)";
+        }
+        std::cout << "  (" << ms << " ms)\n\n";
     }
-    
+
+    flexql_close(db);
     return 0;
 }

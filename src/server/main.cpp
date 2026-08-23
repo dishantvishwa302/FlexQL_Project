@@ -2,43 +2,47 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <csignal>
 
 using namespace flexql;
 
+static Server* g_server = nullptr;
+
+static void on_sigint(int) {
+    if (g_server) g_server->stop();
+}
+
 int main(int argc, char** argv) {
-    int port = 9000; // Default PostgreSQL port
-    
+    int port = 9000;
+
     if (argc > 1) {
         try {
             port = std::stoi(argv[1]);
         } catch (...) {
-            std::cerr << "Usage: " << argv[0] << " [port]" << std::endl;
+            std::cerr << "Usage: " << argv[0] << " [port]\n";
             return 1;
         }
     }
-    
-    std::cout << "\n╔════════════════════════════════════════════════════════════╗" << std::endl;
-    std::cout << "║           FlexQL Server v1.0                              ║" << std::endl;
-    std::cout << "╚════════════════════════════════════════════════════════════╝" << std::endl;
-    
+
+    std::cout << "\n╔════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║           FlexQL Server v1.0                              ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════════╝\n";
+
     Server server(port);
-    
+    g_server = &server;
+    std::signal(SIGINT, on_sigint);
+
     if (!server.start()) {
-        std::cerr << "✗ Failed to start server" << std::endl;
+        std::cerr << "Failed to start server\n";
         return 1;
     }
-    
-    std::cout << "\n✓ Server started successfully" << std::endl;
-    std::cout << "✓ Listening for client connections on port " << port << std::endl;
-    std::cout << "✓ Press Ctrl+C to stop\n" << std::endl;
-    
-    // Keep server running
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    std::cout << "\nListening on port " << port << ". Ctrl+C to stop.\n\n";
+
+    while (server.isRunning()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    
-    server.stop();
-    std::cout << "\n✓ Server stopped" << std::endl;
-    
+
+    std::cout << "\nServer stopped.\n";
     return 0;
 }

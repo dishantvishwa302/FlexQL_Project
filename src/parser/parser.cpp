@@ -2,6 +2,8 @@
 #include <cctype>
 #include <algorithm>
 #include <sstream>
+#include <climits>
+#include <cstdint>
 
 namespace flexql {
 
@@ -80,6 +82,23 @@ TokenType getKeywordType(const std::string& word) {
     if (upper == "JOIN") return TokenType::TOKEN_JOIN;
     if (upper == "ON") return TokenType::TOKEN_ON;
     return TokenType::TOKEN_IDENTIFIER;
+}
+
+static std::string toUpperCopy(const std::string& str) {
+    std::string res = str;
+    std::transform(res.begin(), res.end(), res.begin(), ::toupper);
+    return res;
+}
+
+static Value parseNumberValue(const std::string& text) {
+    if (text.find('.') != std::string::npos) {
+        return Value(std::stod(text));
+    }
+    long long v = std::stoll(text);
+    if (v >= INT32_MIN && v <= INT32_MAX) {
+        return Value(static_cast<int>(v));
+    }
+    return Value(static_cast<double>(v));
 }
 
 class Lexer {
@@ -255,9 +274,7 @@ std::unique_ptr<SelectStatement> Parser::parseSelect() {
                 
                 if (pos < tokens.size()) {
                     if (tokens[pos].type == TokenType::TOKEN_NUMBER) {
-                        stmt->where.value = Value(std::stod(tokens[pos].value) > 1000 ? 
-                            static_cast<int>(std::stod(tokens[pos].value)) : 
-                            static_cast<int>(std::stod(tokens[pos].value)));
+                        stmt->where.value = parseNumberValue(tokens[pos].value);
                     } else if (tokens[pos].type == TokenType::TOKEN_STRING) {
                         stmt->where.value = Value(tokens[pos].value);
                     }
@@ -268,30 +285,32 @@ std::unique_ptr<SelectStatement> Parser::parseSelect() {
         }
     }
     // Parse optional ORDER BY
-    auto to_upper = [](const std::string& str) {
-        std::string res = str;
-        std::transform(res.begin(), res.end(), res.begin(), ::toupper);
-        return res;
-    };
-    if (pos + 1 < tokens.size() && to_upper(tokens[pos].value) == "ORDER" && to_upper(tokens[pos+1].value) == "BY") {
+    if (pos + 1 < tokens.size() && toUpperCopy(tokens[pos].value) == "ORDER" &&
+        toUpperCopy(tokens[pos + 1].value) == "BY") {
         pos += 2;
         if (pos < tokens.size() && tokens[pos].type == TokenType::TOKEN_IDENTIFIER) {
             stmt->order_by.column_name = tokens[pos].value;
             stmt->has_order_by = true;
             pos++;
-            
+
             if (pos < tokens.size() && tokens[pos].type == TokenType::TOKEN_IDENTIFIER) {
-                if (to_upper(tokens[pos].value) == "DESC") {
+                if (toUpperCopy(tokens[pos].value) == "DESC") {
                     stmt->order_by.is_desc = true;
                     pos++;
-                } else if (to_upper(tokens[pos].value) == "ASC") {
+                } else if (toUpperCopy(tokens[pos].value) == "ASC") {
                     stmt->order_by.is_desc = false;
                     pos++;
                 }
             }
         }
     }
-    
+
+    if (pos < tokens.size() && toUpperCopy(tokens[pos].value) == "LIMIT" &&
+        pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::TOKEN_NUMBER) {
+        stmt->limit = std::stoi(tokens[pos + 1].value);
+        pos += 2;
+    }
+
     return stmt;
 }
 
@@ -335,12 +354,7 @@ std::unique_ptr<InsertStatement> Parser::parseInsert() {
         std::vector<Value> current_row;
         while (pos < tokens.size() && tokens[pos].type != TokenType::TOKEN_RPAREN) {
             if (tokens[pos].type == TokenType::TOKEN_NUMBER) {
-                double num = std::stod(tokens[pos].value);
-                if (num == static_cast<int>(num)) {
-                    current_row.push_back(Value(static_cast<int>(num)));
-                } else {
-                    current_row.push_back(Value(num));
-                }
+                current_row.push_back(parseNumberValue(tokens[pos].value));
             } else if (tokens[pos].type == TokenType::TOKEN_STRING) {
                 current_row.push_back(Value(tokens[pos].value));
             }
@@ -401,21 +415,17 @@ std::unique_ptr<CreateTableStatement> Parser::parseCreateTable() {
     
     auto stmt = std::make_unique<CreateTableStatement>();
     pos = 1;
-    
+
     if (pos >= tokens.size() || tokens[pos].type != TokenType::TOKEN_TABLE) {
         error_msg = "Expected TABLE";
         return nullptr;
     }
     pos++;
-    
-    // Check for IF NOT EXISTS
-    auto to_upper = [](const std::string& str) {
-        std::string res = str;
-        std::transform(res.begin(), res.end(), res.begin(), ::toupper);
-        return res;
-    };
-    if (pos + 2 < tokens.size() && to_upper(tokens[pos].value) == "IF" && 
-        tokens[pos+1].type == TokenType::TOKEN_NOT && to_upper(tokens[pos+2].value) == "EXISTS") {
+
+    if (pos + 2 < tokens.size() && toUpperCopy(tokens[pos].value) == "IF" &&
+        tokens[pos + 1].type == TokenType::TOKEN_NOT &&
+        toUpperCopy(tokens[pos + 2].value) == "EXISTS") {
+        stmt->if_not_exists = true;
         pos += 3;
     }
     
@@ -525,7 +535,7 @@ std::unique_ptr<DeleteStatement> Parser::parseDelete() {
                 
                 if (pos < tokens.size()) {
                     if (tokens[pos].type == TokenType::TOKEN_NUMBER) {
-                        stmt->where.value = Value(static_cast<int>(std::stod(tokens[pos].value)));
+                        stmt->where.value = parseNumberValue(tokens[pos].value);
                     } else if (tokens[pos].type == TokenType::TOKEN_STRING) {
                         stmt->where.value = Value(tokens[pos].value);
                     }
@@ -695,7 +705,7 @@ std::unique_ptr<JoinStatement> Parser::parseJoin() {
             }
             if (pos < tokens.size()) {
                 if (tokens[pos].type == TokenType::TOKEN_NUMBER) {
-                    stmt->where.value = Value(static_cast<int>(std::stod(tokens[pos].value)));
+                    stmt->where.value = parseNumberValue(tokens[pos].value);
                 } else if (tokens[pos].type == TokenType::TOKEN_STRING) {
                     stmt->where.value = Value(tokens[pos].value);
                 }
@@ -704,13 +714,9 @@ std::unique_ptr<JoinStatement> Parser::parseJoin() {
             }
         }
     }
-    // Parse optional ORDER BY
-    auto to_upper = [](const std::string& str) {
-        std::string res = str;
-        std::transform(res.begin(), res.end(), res.begin(), ::toupper);
-        return res;
-    };
-    if (pos + 1 < tokens.size() && to_upper(tokens[pos].value) == "ORDER" && to_upper(tokens[pos+1].value) == "BY") {
+
+    if (pos + 1 < tokens.size() && toUpperCopy(tokens[pos].value) == "ORDER" &&
+        toUpperCopy(tokens[pos + 1].value) == "BY") {
         pos += 2;
         if (pos < tokens.size() && tokens[pos].type == TokenType::TOKEN_IDENTIFIER) {
             std::string first = tokens[pos++].value;
@@ -724,17 +730,23 @@ std::unique_ptr<JoinStatement> Parser::parseJoin() {
                 stmt->order_by.column_name = first;
             }
             stmt->has_order_by = true;
-            
+
             if (pos < tokens.size() && tokens[pos].type == TokenType::TOKEN_IDENTIFIER) {
-                if (to_upper(tokens[pos].value) == "DESC") {
+                if (toUpperCopy(tokens[pos].value) == "DESC") {
                     stmt->order_by.is_desc = true;
                     pos++;
-                } else if (to_upper(tokens[pos].value) == "ASC") {
+                } else if (toUpperCopy(tokens[pos].value) == "ASC") {
                     stmt->order_by.is_desc = false;
                     pos++;
                 }
             }
         }
+    }
+
+    if (pos < tokens.size() && toUpperCopy(tokens[pos].value) == "LIMIT" &&
+        pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::TOKEN_NUMBER) {
+        stmt->limit = std::stoi(tokens[pos + 1].value);
+        pos += 2;
     }
 
     return stmt;

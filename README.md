@@ -1,119 +1,86 @@
-# FlexQL: A Flexible SQL-like Database Driver
+# FlexQL: A small SQL-like database you can explain in an interview
 
-## Compilation & Execution
+Client/server database in C++17. No SQLite, no Boost. The REPL talks to the server only through `flexql_open` / `flexql_exec` / `flexql_close`.
 
-### Build Instructions
+## 5-minute demo
+
 ```bash
-# Compile all binaries (Server, Client, Benchmark)
 make clean && make -j4
+
+# terminal 1
+./bin/flexql_server
+
+# terminal 2
+./bin/flexql_client
 ```
 
-### Running the System
-1. **Start the Server**:
-   ```bash
-   ./bin/flexql_server
-   ```
-2. **Start the Client (REPL)**:
-   ```bash
-   ./bin/flexql_client
-   ```
-3. **Run Performance Benchmark**:
-   ```bash
-   ./bin/benchmark_flexql
-   ```
+Then paste:
 
----
+```sql
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT);
+INSERT INTO users VALUES (1, 'Alice', 22), (2, 'Bob', 30), (3, 'Carol', 25);
+SELECT * FROM users;
+SELECT * FROM users;
+SELECT * FROM users WHERE id = 2;
+SELECT name, age FROM users WHERE age > 23 ORDER BY age DESC;
+SELECT * FROM users LIMIT 2;
 
+CREATE TABLE orders (oid INT PRIMARY KEY, uid INT, amount DECIMAL);
+INSERT INTO orders VALUES (10, 1, 50.5), (11, 1, 120), (12, 3, 9.99);
+SELECT users.name, orders.amount
+FROM users INNER JOIN orders ON users.id = orders.uid
+WHERE orders.amount > 20;
 
-## Features & SQL Support
+INSERT INTO users VALUES (4, 'tmp', 0) WITH TTL 3;
+SELECT * FROM users WHERE id = 4;
+-- wait 3 seconds, then:
+SELECT * FROM users WHERE id = 4;
 
-FlexQL supports a robust subset of SQL functionality as defined in the requirements:
-
-- **Data Types**: `INT`, `DECIMAL`, `VARCHAR`, `DATETIME`.
-- **CREATE TABLE**: Full schema enforcement with Primary Key support.
-- **INSERT**: High-speed batch insertions with row-level expiration (TTL).
-- **SELECT**: Supports `SELECT *` and specific column selection.
-- **WHERE Clause**: Single-condition filtering (e.g., `WHERE column = VALUE`).
-- **INNER JOIN**: Efficient joining of two tables on a shared column.
-- **TTL (Time-To-Live)**: Automatic row expiration handling.
-
----
-
-## System Architecture & Design
-
-### 1. Storage Layout (Row-Major Persistent)
-Data is stored in binary `.dat` files under `data/tables/`. 
-- **Serialization**: Rows are serialized as `[deleted_flag (1B) | expiry_time (8B) | column_data...]`.
-- **Fixed vs Variable**: Numeric types (`INT`, `DECIMAL`, `DATETIME`) use fixed widths for fast offset calculation. `VARCHAR` uses length-prefixed encoding.
-- **Persistence**: RAM is used primarily for caching and indexing; the disk remains the authoritative source of truth.
-
-### 2. High-Performance Write Path
-To handle 10 million rows without system crashes (OOM):
-- **Batch Serialization**: Rows are buffered and written in chunks (e.g., 5,000 rows) using a single `write()` system call.
-- **Memory Management**: Uses `fdatasync()` and `posix_fadvise` every 100K rows to force data to disk and reclaim kernel page cache, preventing RAM saturation.
-- **Zero-Copy**: Move semantics are utilized during parsing to transfer data ownership directly to storage without redundant allocations.
-
-### 3. Indexing Strategy
-- **B-Tree**: An in-memory B-Tree (Order 64) maps Primary Keys to physical file offsets.
-- **Lookup Complexity**: O(log N) for primary key queries.
-- **Node Pooling**: A custom node allocator reduces heap fragmentation and improves CPU cache locality.
-
-### 4. LRU Query Caching
-- **Implementation**: A 4096-entry Least Recently Used (LRU) cache stores query results.
-- **Invalidation**: Any mutation (`INSERT`, `DELETE`) automatically invalidates relevant cache entries to ensure data consistency.
-
-### 5. Multi-threaded Server
-- **Client Handling**: The server spawns a dedicated thread per client connection.
-- **Concurrency Control**: Shared data structures are protected by `std::recursive_mutex` to ensure thread safety without deadlocks.
-- **TCP Framing**: Custom protocol using `\n<EOF>\n` delimiters to handle TCP fragmentation for large multi-row packets.
-
-### 6. Row Expiration (TTL)
-- **Lazy Deletion**: Expired rows are filtered out during read operations.
-- **Active GC**: A background Garbage Collector thread sweeps the database every 30 seconds to reclaim space from expired or deleted rows.
-
----
-
-## API Specification
-
-FlexQL provides a clean C/C++ API for application integration:
-
-```cpp
-// Open a connection to the server
-int flexql_open(const char *host, int port, FlexQL **db);
-
-// Execute an SQL statement
-int flexql_exec(FlexQL *db, const char *sql, 
-                int (*callback)(void*, int, char**, char**), 
-                void *arg, char **errmsg);
-
-// Close the connection and free resources
-int flexql_close(FlexQL *db);
-
-// Free memory allocated by the API (e.g., errmsg)
-void flexql_free(void *ptr);
+DELETE FROM users WHERE id = 2;
 ```
 
----
+Run the same `SELECT * FROM users;` twice. The second call should be faster — that is the LRU cache.
 
-
-## Project Structure
-```
-flexql/
-├── bin/            # Compiled binaries
-├── build/          # Object files
-├── data/           # Persistent storage (.dat files)
-├── include/        # Header files
-├── src/            # Source code
-│   ├── client/     # Client REPL implementation
-│   ├── server/     # Multithreaded server logic
-│   ├── storage/    # Row-major storage engine
-│   └── ...         # Index, Cache, Parser modules
-└── Makefile        # Build system
+```bash
+# optional: 1M-row insert benchmark (server must be running)
+./bin/benchmark_flexql --unit-test
+./bin/benchmark_flexql 1000000
 ```
 
+## What it implements (assignment)
 
-## Performance Highlights :
+| Feature | How |
+|---|---|
+| CREATE TABLE | Schema on disk (`data/tables/<name>.schema`) |
+| INSERT | Row-major `.dat` file, batched `write()` |
+| SELECT / WHERE | One condition. PK equality uses the B-tree |
+| INNER JOIN | Hash join on the `ON` column |
+| Types | INT, DECIMAL, VARCHAR, DATETIME |
+| Index | In-memory B-tree: INT PK → file offset |
+| Cache | LRU of SELECT results, dropped on INSERT/DELETE |
+| Threads | One thread per client + mutex on the file |
+| TTL | Expiry timestamp per row; lazy skip + 30s GC |
 
-Refer to `PERFORMANCE.md` file for highlights
+## Interview extras (not required, useful to talk about)
 
----
+- `ORDER BY` / `LIMIT` (LIMIT after ORDER BY, stop early on scans when there is no ORDER BY)
+- `DELETE`
+- `CREATE TABLE IF NOT EXISTS`
+- `WITH TTL seconds`
+- Schema reload on server restart
+
+## Layout
+
+```
+include/     public C API + engine headers
+src/client   REPL (uses flexql_* only)
+src/server   TCP server
+src/parser   lexer + recursive-descent parser
+src/query    executor (select / insert / join / delete)
+src/storage  row file + schema
+src/index    B-tree
+src/cache    LRU
+src/common   types + C API
+```
+
+Design notes: `DESIGN_DOC.md`. Numbers from a previous 1M/10M run: `PERFORMANCE.md`.

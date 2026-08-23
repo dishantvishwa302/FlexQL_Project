@@ -30,6 +30,7 @@ struct SelectStatement {
     bool has_where;
     OrderByClause order_by;
     bool has_order_by{false};
+    int limit{-1}; // -1 = no LIMIT
 };
 
 struct InsertStatement {
@@ -48,6 +49,7 @@ struct DeleteStatement {
 struct CreateTableStatement {
     std::string table_name;
     std::vector<Column> columns;
+    bool if_not_exists{false};
 };
 
 struct JoinStatement {
@@ -62,6 +64,7 @@ struct JoinStatement {
     OrderByClause order_by;
     bool has_order_by{false};
     std::string order_table; // which table the ORDER BY column belongs to (prefix)
+    int limit{-1}; // -1 = no LIMIT
 };
 
 // Forward declarations

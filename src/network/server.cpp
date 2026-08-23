@@ -24,7 +24,7 @@ Server::~Server() {
 }
 
 bool Server::start() {
-    running = true;
+    running.store(true);
 
     // Create socket
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -66,9 +66,9 @@ bool Server::start() {
 
     // Background thread: clean up expired rows every 30 seconds
     std::thread ttl_thread([this]() {
-        while (running) {
+        while (running.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(30));
-            if (!running) break;
+            if (!running.load()) break;
             try {
                 database->cleanupExpiredRows();
             } catch (...) {}
@@ -80,7 +80,7 @@ bool Server::start() {
 }
 
 void Server::stop() {
-    running = false;
+    running.store(false);
     if (server_socket >= 0) {
         close(server_socket);
         server_socket = -1;
@@ -91,7 +91,7 @@ void Server::acceptConnections() {
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
-    while (running) {
+    while (running.load()) {
         int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &addr_len);
         if (client_socket < 0) break;
 
@@ -110,7 +110,7 @@ void Server::handleClient(int client_socket) {
 
     std::string query_buffer;
 
-    while (running) {
+    while (running.load()) {
         memset(buffer, 0, sizeof(buffer));
         int n = read(client_socket, buffer, sizeof(buffer) - 1);
 
@@ -156,11 +156,16 @@ std::string Server::formatResponse(const QueryResult& result) {
         if (result.stats.cache_hit) response += "CACHE: HIT\n";
 
         if (!result.rows.empty()) {
-            response += "---\n";
+            response += "COLUMNS: ";
+            for (size_t i = 0; i < result.rows[0].column_names.size(); i++) {
+                response += result.rows[0].column_names[i];
+                if (i + 1 < result.rows[0].column_names.size()) response += " | ";
+            }
+            response += "\n---\n";
             for (const auto& row : result.rows) {
                 for (size_t i = 0; i < row.values.size(); i++) {
                     response += row.values[i];
-                    if (i < row.values.size() - 1) response += " | ";
+                    if (i + 1 < row.values.size()) response += " | ";
                 }
                 response += "\n";
             }
